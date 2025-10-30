@@ -1,27 +1,44 @@
 <?php
 
-/**
- * Enhanced Payment Processing System with Chaos Engineering - PHP Version
- * Improved with security, logging, persistence, and better architecture
- */
-
-// Enhanced Configuration management
 class Config {
     private static ?self $instance = null;
     private array $config;
     
     private function __construct() {
-        // Load from environment with defaults
         $this->config = [
-            'baseFailureRate' => (float)($_ENV['PAYMENT_BASE_FAILURE_RATE'] ?? 0.05),
-            'maxRetries' => (int)($_ENV['PAYMENT_MAX_RETRIES'] ?? 2),
-            'gatewayTimeout' => (float)($_ENV['PAYMENT_GATEWAY_TIMEOUT'] ?? 30.0),
-            'fraudThreshold' => (float)($_ENV['PAYMENT_FRAUD_THRESHOLD'] ?? 0.7),
-            'circuitBreakerFailures' => (int)($_ENV['CIRCUIT_BREAKER_FAILURES'] ?? 5),
-            'circuitBreakerReset' => (float)($_ENV['CIRCUIT_BREAKER_RESET'] ?? 60.0),
-            'maxAmount' => (float)($_ENV['PAYMENT_MAX_AMOUNT'] ?? 10000.0),
-            'logLevel' => $_ENV['LOG_LEVEL'] ?? 'INFO',
+            'baseFailureRate' => $this->getEnvFloat('PAYMENT_BASE_FAILURE_RATE', 0.05, 0.0, 1.0),
+            'maxRetries' => $this->getEnvInt('PAYMENT_MAX_RETRIES', 2, 0, 10),
+            'gatewayTimeout' => $this->getEnvFloat('PAYMENT_GATEWAY_TIMEOUT', 30.0, 1.0, 300.0),
+            'fraudThreshold' => $this->getEnvFloat('PAYMENT_FRAUD_THRESHOLD', 0.7, 0.0, 1.0),
+            'circuitBreakerFailures' => $this->getEnvInt('CIRCUIT_BREAKER_FAILURES', 5, 1, 100),
+            'circuitBreakerReset' => $this->getEnvFloat('CIRCUIT_BREAKER_RESET', 60.0, 1.0, 3600.0),
+            'maxAmount' => $this->getEnvFloat('PAYMENT_MAX_AMOUNT', 10000.0, 0.0, 1000000.0),
+            'logLevel' => $this->getEnvString('LOG_LEVEL', 'INFO', ['DEBUG', 'INFO', 'WARNING', 'ERROR']),
         ];
+    }
+    
+    private function getEnvFloat(string $key, float $default, float $min, float $max): float {
+        $value = (float)($_ENV[$key] ?? $default);
+        if ($value < $min || $value > $max) {
+            throw new InvalidArgumentException("$key must be between $min and $max");
+        }
+        return $value;
+    }
+    
+    private function getEnvInt(string $key, int $default, int $min, int $max): int {
+        $value = (int)($_ENV[$key] ?? $default);
+        if ($value < $min || $value > $max) {
+            throw new InvalidArgumentException("$key must be between $min and $max");
+        }
+        return $value;
+    }
+    
+    private function getEnvString(string $key, string $default, array $allowed): string {
+        $value = $_ENV[$key] ?? $default;
+        if (!in_array($value, $allowed)) {
+            throw new InvalidArgumentException("$key must be one of: " . implode(', ', $allowed));
+        }
+        return $value;
     }
     
     public static function getInstance(): self {
@@ -39,12 +56,10 @@ class Config {
         return $this->config;
     }
     
-    // Prevent cloning and unserialization
     private function __clone() {}
     public function __wakeup() {}
 }
 
-// Enhanced error handling
 class PaymentError extends Exception {
     private string $errorCode;
     private string $paymentId;
@@ -90,7 +105,6 @@ class PaymentError extends Exception {
     }
 }
 
-// Pre-defined error types
 class PaymentErrors {
     public static function fraudDetected(): PaymentError {
         return new PaymentError('FRAUD', 'Transaction flagged as fraudulent', '', false);
@@ -117,7 +131,6 @@ class PaymentErrors {
     }
 }
 
-// Enhanced Logging System
 class Logger {
     private string $logLevel;
     private string $logFile;
@@ -161,14 +174,13 @@ class Logger {
     }
 }
 
-// Business domain models
 class Payment {
     public string $id;
     public float $amount;
     public string $currency;
     public string $merchantId;
     public string $customerId;
-    public string $status = 'pending'; // pending, processing, completed, failed
+    public string $status = 'pending';
     public DateTime $createdAt;
     public ?DateTime $processedAt = null;
     public string $errorReason = '';
@@ -193,12 +205,11 @@ class Payment {
     }
 
     public function sanitize(): void {
-        // Sanitize inputs
         $this->id = htmlspecialchars($this->id, ENT_QUOTES, 'UTF-8');
         $this->merchantId = htmlspecialchars($this->merchantId, ENT_QUOTES, 'UTF-8');
         $this->customerId = htmlspecialchars($this->customerId, ENT_QUOTES, 'UTF-8');
         $this->currency = strtoupper(trim($this->currency));
-        $this->amount = round($this->amount, 2); // Ensure proper precision
+        $this->amount = round($this->amount, 2);
     }
 
     public function validate(): void {
@@ -208,7 +219,6 @@ class Payment {
             throw PaymentErrors::invalidAmount();
         }
         
-        // Validate amount precision
         if (round($this->amount, 2) != $this->amount) {
             throw new PaymentError('INVALID_AMOUNT_PRECISION', 'Amount must have at most 2 decimal places', '', false);
         }
@@ -226,7 +236,6 @@ class Payment {
             throw new PaymentError('INVALID_CUSTOMER', 'Customer ID is required and must be alphanumeric', '', false);
         }
         
-        // Validate ID length and format
         if (!preg_match('/^pay_\d+_\d+$/', $this->id)) {
             throw new PaymentError('INVALID_PAYMENT_ID', 'Invalid payment ID format', '', false);
         }
@@ -252,7 +261,7 @@ class Payment {
 class PaymentGateway {
     public string $name;
     public float $successRate;
-    public float $latency; // in seconds
+    public float $latency;
     public bool $isActive;
 
     public function __construct(string $name, float $successRate, float $latency, bool $isActive = true) {
@@ -283,7 +292,6 @@ class FraudDetectionResult {
     }
 }
 
-// Circuit Breaker pattern
 class CircuitBreakerState {
     const CLOSED = 'closed';
     const OPEN = 'open';
@@ -299,11 +307,17 @@ class CircuitBreaker {
     private int $totalRequests = 0;
     private int $failedRequests = 0;
     private float $lastSuccessTime = 0;
+    private int $halfOpenSuccesses = 0;
+    private int $halfOpenMaxSuccesses = 3;
 
     public function __construct(int $maxFailures, float $resetTimeout) {
         $this->maxFailures = $maxFailures;
         $this->resetTimeout = $resetTimeout;
-        $this->lock = fopen('php://temp', 'r+'); // Simple lock mechanism
+        $lockFile = sys_get_temp_dir() . '/circuit_breaker_' . uniqid() . '.lock';
+        $this->lock = fopen($lockFile, 'w+');
+        if (!$this->lock) {
+            throw new RuntimeException('Cannot create lock file');
+        }
     }
 
     public function __destruct() {
@@ -315,16 +329,16 @@ class CircuitBreaker {
     public function allow(): bool {
         flock($this->lock, LOCK_EX);
         try {
+            $this->totalRequests++;
+            
             if ($this->failures >= $this->maxFailures) {
                 if ($this->lastFailure && (microtime(true) - $this->lastFailure) > $this->resetTimeout) {
-                    // Auto-reset after timeout
                     $this->failures = 0;
-                    $this->totalRequests++;
+                    $this->halfOpenSuccesses = 0;
                     return true;
                 }
                 return false;
             }
-            $this->totalRequests++;
             return true;
         } finally {
             flock($this->lock, LOCK_UN);
@@ -334,7 +348,15 @@ class CircuitBreaker {
     public function recordSuccess(): void {
         flock($this->lock, LOCK_EX);
         try {
-            $this->failures = 0;
+            if ($this->failures >= $this->maxFailures) {
+                $this->halfOpenSuccesses++;
+                if ($this->halfOpenSuccesses >= $this->halfOpenMaxSuccesses) {
+                    $this->failures = 0;
+                    $this->halfOpenSuccesses = 0;
+                }
+            } else {
+                $this->failures = max(0, $this->failures - 1);
+            }
             $this->lastSuccessTime = microtime(true);
         } finally {
             flock($this->lock, LOCK_UN);
@@ -410,7 +432,6 @@ class PaymentMetrics {
     }
 }
 
-// Database Abstraction for Persistence
 interface PaymentRepositoryInterface {
     public function save(Payment $payment): bool;
     public function findById(string $id): ?Payment;
@@ -421,20 +442,52 @@ interface PaymentRepositoryInterface {
 class FilePaymentRepository implements PaymentRepositoryInterface {
     private string $storagePath;
     private $lock;
+    private Logger $logger;
     
-    public function __construct(string $storagePath) {
+    public function __construct(string $storagePath, ?Logger $logger = null) {
         $this->storagePath = rtrim($storagePath, '/') . '/';
+        $this->logger = $logger ?? new Logger();
+        
         if (!is_dir($this->storagePath)) {
-            mkdir($this->storagePath, 0755, true);
+            if (!mkdir($this->storagePath, 0755, true)) {
+                throw new RuntimeException("Cannot create storage directory: {$this->storagePath}");
+            }
         }
-        $this->lock = fopen('php://temp', 'r+');
+        
+        $lockFile = sys_get_temp_dir() . '/payment_repo_' . md5($this->storagePath) . '.lock';
+        $this->lock = fopen($lockFile, 'w+');
+        if (!$this->lock) {
+            throw new RuntimeException("Cannot create lock file: $lockFile");
+        }
+    }
+    
+    public function __destruct() {
+        if (is_resource($this->lock)) {
+            fclose($this->lock);
+        }
     }
     
     public function save(Payment $payment): bool {
         $filename = $this->storagePath . $payment->id . '.json';
+        $tempFile = $filename . '.tmp';
+        
         flock($this->lock, LOCK_EX);
         try {
-            return file_put_contents($filename, json_encode($payment->toArray()), LOCK_EX) !== false;
+            $data = json_encode($payment->toArray(), JSON_PRETTY_PRINT);
+            if ($data === false) {
+                throw new RuntimeException('JSON encoding failed');
+            }
+            
+            if (file_put_contents($tempFile, $data, LOCK_EX) === false) {
+                throw new RuntimeException("Cannot write to temporary file: $tempFile");
+            }
+            
+            if (!rename($tempFile, $filename)) {
+                unlink($tempFile);
+                throw new RuntimeException("Cannot rename temporary file to: $filename");
+            }
+            
+            return true;
         } finally {
             flock($this->lock, LOCK_UN);
         }
@@ -462,7 +515,6 @@ class FilePaymentRepository implements PaymentRepositoryInterface {
             return null;
         }
         
-        // This is a simplified implementation - in production, you'd index by idempotency key
         $files = glob($this->storagePath . '*.json');
         foreach ($files as $file) {
             flock($this->lock, LOCK_SH);
@@ -471,6 +523,12 @@ class FilePaymentRepository implements PaymentRepositoryInterface {
                 if ($data && isset($data['idempotency_key']) && $data['idempotency_key'] === $key) {
                     return $this->hydratePayment($data);
                 }
+            } catch (Exception $e) {
+                $this->logger->warning('Error reading payment file', [
+                    'file' => $file,
+                    'error' => $e->getMessage()
+                ]);
+                continue;
             } finally {
                 flock($this->lock, LOCK_UN);
             }
@@ -497,7 +555,6 @@ class FilePaymentRepository implements PaymentRepositoryInterface {
             }
         }
         
-        // Sort by creation date, most recent first
         usort($payments, function($a, $b) {
             return $b->createdAt <=> $a->createdAt;
         });
@@ -525,8 +582,38 @@ class FilePaymentRepository implements PaymentRepositoryInterface {
     }
 }
 
-// Core business service
+trait RetryableTrait {
+    protected function withRetry(callable $operation, int $maxRetries = 3, float $delay = 0.1): mixed {
+        $lastException = null;
+        
+        for ($attempt = 0; $attempt <= $maxRetries; $attempt++) {
+            try {
+                return $operation();
+            } catch (Exception $e) {
+                $lastException = $e;
+                
+                if ($attempt < $maxRetries && $this->isRetryable($e)) {
+                    usleep((int)($delay * 1000000 * (2 ** $attempt)));
+                    continue;
+                }
+                break;
+            }
+        }
+        
+        throw $lastException;
+    }
+    
+    private function isRetryable(Exception $e): bool {
+        if ($e instanceof PaymentError) {
+            return $e->isRetryable();
+        }
+        return true;
+    }
+}
+
 class PaymentProcessor {
+    use RetryableTrait;
+
     private Config $config;
     private array $gateways;
     private FraudDetectionService $fraudService;
@@ -556,7 +643,12 @@ class PaymentProcessor {
         $this->fraudService = new FraudDetectionService($this->config);
         $this->chaosInjector = new ChaosInjector($this->config);
         $this->metrics = new PaymentMetrics();
-        $this->lock = fopen('php://temp', 'r+');
+        
+        $lockFile = sys_get_temp_dir() . '/payment_processor_' . uniqid() . '.lock';
+        $this->lock = fopen($lockFile, 'w+');
+        if (!$this->lock) {
+            throw new RuntimeException('Cannot create lock file');
+        }
         
         foreach ($this->gateways as $gateway) {
             $this->circuitBreakers[$gateway->name] = new CircuitBreaker(
@@ -588,7 +680,6 @@ class PaymentProcessor {
         string $customerId,
         string $idempotencyKey
     ): Payment {
-        // Check idempotency first
         if (!empty($idempotencyKey)) {
             $existingPayment = $this->repository->findByIdempotencyKey($idempotencyKey);
             if ($existingPayment) {
@@ -614,7 +705,6 @@ class PaymentProcessor {
         try {
             $payment->validate();
             
-            // Check maximum amount
             if ($this->config->maxAmount > 0 && $payment->amount > $this->config->maxAmount) {
                 throw PaymentErrors::amountTooHigh($this->config->maxAmount);
             }
@@ -642,7 +732,6 @@ class PaymentProcessor {
         ]);
 
         try {
-            // Step 1: Fraud detection
             $fraudResult = $this->fraudService->checkPayment($payment);
             if ($fraudResult->isFraudulent) {
                 flock($this->lock, LOCK_EX);
@@ -665,13 +754,10 @@ class PaymentProcessor {
                 return $this->handlePaymentFailure($payment, $fraudError, $startTime);
             }
 
-            // Step 2: Inject chaos
             $this->chaosInjector->injectPaymentChaos($payment);
 
-            // Step 3: Process with selected gateway
             $gateway = $this->selectPaymentGateway();
             
-            // Check circuit breaker
             $circuitBreaker = $this->circuitBreakers[$gateway->name];
             if (!$circuitBreaker->allow()) {
                 $circuitError = new PaymentError(
@@ -693,7 +779,6 @@ class PaymentProcessor {
             $payment->status = 'processing';
             $this->repository->save($payment);
 
-            // Process with gateway
             list($success, $processError) = $this->processWithGateway($payment, $gateway);
             
             if ($processError) {
@@ -712,7 +797,6 @@ class PaymentProcessor {
             }
 
             if (!$success) {
-                // Retry logic
                 if ($payment->retryCount < $this->config->maxRetries) {
                     $payment->retryCount++;
                     $this->logger->info("Retrying payment {$payment->id}", [
@@ -764,47 +848,38 @@ class PaymentProcessor {
     }
 
     private function processWithGateway(Payment $payment, PaymentGateway $gateway): array {
-        try {
-            $this->logger->debug('Processing with gateway', [
-                'payment_id' => $payment->id,
-                'gateway' => $gateway->name,
-                'latency' => $gateway->latency
-            ]);
+        return $this->withRetry(
+            function() use ($payment, $gateway) {
+                $this->logger->debug('Processing with gateway', [
+                    'payment_id' => $payment->id,
+                    'gateway' => $gateway->name,
+                    'latency' => $gateway->latency
+                ]);
 
-            // Simulate gateway latency
-            $processingTime = $gateway->latency + (mt_rand(0, 100) / 1000); // Add random jitter
-            
-            // Use timeout simulation
-            $start = microtime(true);
-            while ((microtime(true) - $start) < $processingTime) {
-                if ((microtime(true) - $start) > $this->config->gatewayTimeout) {
-                    return [false, PaymentErrors::gatewayTimeout()];
+                $processingTime = $gateway->latency + (mt_rand(0, 100) / 1000);
+                $start = microtime(true);
+                
+                while ((microtime(true) - $start) < $processingTime) {
+                    if ((microtime(true) - $start) > $this->config->gatewayTimeout) {
+                        return [false, PaymentErrors::gatewayTimeout()];
+                    }
+                    usleep(1000);
                 }
-                usleep(1000); // Sleep 1ms to prevent busy waiting
-            }
 
-            // Determine success based on gateway success rate and chaos
-            $successThreshold = $gateway->successRate * $this->chaosInjector->getSuccessRateModifier();
-            $success = mt_rand() / mt_getrandmax() <= $successThreshold;
-            
-            $this->logger->debug('Gateway processing completed', [
-                'payment_id' => $payment->id,
-                'gateway' => $gateway->name,
-                'success' => $success,
-                'success_threshold' => $successThreshold
-            ]);
-            
-            return [$success, null];
-
-        } catch (Exception $e) {
-            $this->logger->error('Exception in gateway processing', [
-                'payment_id' => $payment->id,
-                'gateway' => $gateway->name,
-                'error' => $e->getMessage()
-            ]);
-            
-            return [false, new PaymentError('GATEWAY_ERROR', $e->getMessage(), $payment->id, true)];
-        }
+                $successThreshold = $gateway->successRate * $this->chaosInjector->getSuccessRateModifier();
+                $success = mt_rand() / mt_getrandmax() <= $successThreshold;
+                
+                $this->logger->debug('Gateway processing completed', [
+                    'payment_id' => $payment->id,
+                    'gateway' => $gateway->name,
+                    'success' => $success,
+                    'success_threshold' => $successThreshold
+                ]);
+                
+                return [$success, null];
+            },
+            $this->config->maxRetries
+        );
     }
 
     private function selectPaymentGateway(): PaymentGateway {
@@ -821,7 +896,6 @@ class PaymentProcessor {
             }
 
             if (empty($activeGateways)) {
-                // Fallback to first gateway in emergency
                 $this->logger->warning('No active gateways available, using fallback');
                 return $this->gateways[0];
             }
@@ -850,7 +924,6 @@ class PaymentProcessor {
             $this->metrics->totalProcessed++;
             $this->metrics->totalAmount += $payment->amount;
 
-            // Update average processing time
             if ($this->metrics->successful === 1) {
                 $this->metrics->averageProcessingTime = $processingTime;
             } else {
@@ -925,7 +998,6 @@ class PaymentProcessor {
             }
         }
 
-        // Get circuit breaker states and metrics
         foreach ($this->circuitBreakers as $gatewayName => $circuitBreaker) {
             $circuitStates[$gatewayName] = $circuitBreaker->state();
             $gatewayMetrics[$gatewayName] = $circuitBreaker->getMetrics();
@@ -969,7 +1041,6 @@ class PaymentProcessor {
             return false;
         }
         
-        // In a real implementation, you'd add reset logic to CircuitBreaker
         $this->logger->info('Circuit breaker reset requested', ['gateway' => $gatewayName]);
         return true;
     }
@@ -1004,7 +1075,6 @@ class PaymentProcessor {
     }
 }
 
-// Fraud Detection Service
 class FraudDetectionService {
     private Config $config;
     private array $riskPatterns;
@@ -1025,26 +1095,22 @@ class FraudDetectionService {
     public function checkPayment(Payment $payment): FraudDetectionResult {
         $this->logger->debug('Running fraud detection', ['payment_id' => $payment->id]);
         
-        // Simulate fraud detection processing
-        usleep(50000); // 50ms
+        usleep(50000);
 
         $riskScore = mt_rand() / mt_getrandmax();
         $reasons = [];
 
-        // High amount transactions have higher risk
         if ($payment->amount > 1000) {
             $riskScore += 0.3;
             $reasons[] = 'high_amount';
         }
 
-        // Random risk patterns
         if (mt_rand() / mt_getrandmax() < 0.1) {
             $pattern = $this->riskPatterns[array_rand($this->riskPatterns)];
             $reasons[] = $pattern;
             $riskScore += 0.4;
         }
 
-        // Ensure risk score is between 0 and 1
         $riskScore = min(max($riskScore, 0.0), 1.0);
         $isFraudulent = $riskScore > $this->config->fraudThreshold;
 
@@ -1059,11 +1125,10 @@ class FraudDetectionService {
     }
 }
 
-// Chaos Injector
 class ChaosInjector {
     private Config $config;
     private float $failureRate;
-    private float $latencyRange = 2.0; // 2 seconds max latency
+    private float $latencyRange = 2.0;
     private array $gatewayOutages = [];
     private $lock;
     private Logger $logger;
@@ -1072,7 +1137,11 @@ class ChaosInjector {
         $this->config = $config;
         $this->failureRate = $config->baseFailureRate;
         $this->logger = $logger ?? new Logger();
-        $this->lock = fopen('php://temp', 'r+');
+        $lockFile = sys_get_temp_dir() . '/chaos_injector_' . uniqid() . '.lock';
+        $this->lock = fopen($lockFile, 'w+');
+        if (!$this->lock) {
+            throw new RuntimeException('Cannot create lock file');
+        }
     }
 
     public function __destruct() {
@@ -1082,8 +1151,7 @@ class ChaosInjector {
     }
 
     public function injectPaymentChaos(Payment $payment): void {
-        // Random gateway outages
-        if (mt_rand() / mt_getrandmax() < 0.02) { // 2% chance of gateway outage
+        if (mt_rand() / mt_getrandmax() < 0.02) {
             $gateway = (mt_rand() / mt_getrandmax() < 0.5) ? 'Stripe' : 'PayPal';
             flock($this->lock, LOCK_EX);
             $this->gatewayOutages[$gateway] = true;
@@ -1091,14 +1159,11 @@ class ChaosInjector {
             $this->logger->warning('Simulating gateway outage', ['gateway' => $gateway]);
         }
 
-        // Random latency spikes
-        if (mt_rand() / mt_getrandmax() < 0.03) { // 3% chance of high latency
+        if (mt_rand() / mt_getrandmax() < 0.03) {
             $latency = mt_rand() / mt_getrandmax() * $this->latencyRange;
             usleep((int)($latency * 1000000));
             $this->logger->warning('Injected latency', ['latency' => $latency]);
         }
-
-        // Simulate network timeouts (handled in gateway processing)
     }
 
     public function getSuccessRateModifier(): float {
@@ -1113,10 +1178,23 @@ class ChaosInjector {
     }
 }
 
-// Demo execution with enhanced error handling
-function main() {
+function main(): int {
     try {
-        // Set up error handling
+        if (!extension_loaded('json')) {
+            throw new RuntimeException('JSON extension is required');
+        }
+        
+        $dotenvPath = __DIR__ . '/.env';
+        if (file_exists($dotenvPath)) {
+            $lines = file($dotenvPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+            foreach ($lines as $line) {
+                if (strpos(trim($line), '#') === 0) continue;
+                
+                list($name, $value) = explode('=', $line, 2);
+                $_ENV[trim($name)] = trim($value);
+            }
+        }
+        
         set_error_handler(function($errno, $errstr, $errfile, $errline) {
             throw new ErrorException($errstr, 0, $errno, $errfile, $errline);
         });
@@ -1124,20 +1202,24 @@ function main() {
         echo "Enhanced Payment Processing System with Chaos Engineering - PHP Version\n";
         echo str_repeat("=", 80) . "\n";
 
-        // Load environment configuration
         $config = Config::getInstance();
         $logger = new Logger($config->logLevel);
-        $repository = new FilePaymentRepository('./data/payments');
         
+        $directories = ['./data/payments', './reports'];
+        foreach ($directories as $dir) {
+            if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+                throw new RuntimeException("Cannot create directory: $dir");
+            }
+        }
+        
+        $repository = new FilePaymentRepository('./data/payments', $logger);
         $processor = new PaymentProcessor($config, $repository, $logger);
 
-        // Simulate business transactions
         $merchants = ['amazon', 'netflix', 'spotify', 'uber', 'starbucks'];
         $customers = ['cust_001', 'cust_002', 'cust_003', 'cust_004', 'cust_005'];
 
         echo "\nProcessing payments...\n";
 
-        // Process multiple payments
         $successful = 0;
         $failed = 0;
 
@@ -1162,13 +1244,11 @@ function main() {
                 $failed++;
             }
 
-            // Small delay between transactions
-            usleep(100000); // 100ms
+            usleep(100000);
         }
 
         echo "\nCompleted $successful successful transactions, $failed failed\n";
 
-        // Generate business report
         echo "\nEnhanced Business Report:\n";
         echo str_repeat("=", 50) . "\n";
 
@@ -1192,7 +1272,6 @@ function main() {
             echo "  $gateway: $state\n";
         }
 
-        // Save detailed report
         try {
             $processor->saveReportToFile('./reports/enhanced_payment_report_php.json');
             echo "\nDetailed report saved to ./reports/enhanced_payment_report_php.json\n";
@@ -1200,7 +1279,6 @@ function main() {
             echo "\nError saving report: {$e->getMessage()}\n";
         }
 
-        // Demonstrate system resilience
         echo "\nEnhanced Chaos Resilience Analysis:\n";
         echo str_repeat("=", 40) . "\n";
         echo "System handled " . number_format($metrics['success_rate'] * 100, 1) . "% success rate under chaos conditions\n";
@@ -1209,7 +1287,6 @@ function main() {
         echo "Processed \${$metrics['total_amount']} in total transaction volume\n";
         echo "Average processing time: {$metrics['average_processing_time']}s\n";
         
-        // Show configuration
         echo "\nSystem Configuration:\n";
         echo "Max Retries: {$config->maxRetries}\n";
         echo "Fraud Threshold: {$config->fraudThreshold}\n";
@@ -1217,19 +1294,19 @@ function main() {
         echo "Circuit Breaker: {$config->circuitBreakerFailures} failures / {$config->circuitBreakerReset}s reset\n";
         echo "Log Level: {$config->logLevel}\n";
 
+        return 0;
+        
     } catch (Throwable $e) {
-        echo "Fatal error in payment processor: " . $e->getMessage() . "\n";
-        echo "Stack trace: " . $e->getTraceAsString() . "\n";
-        exit(1);
+        error_log("Fatal error: " . $e->getMessage());
+        error_log("Stack trace: " . $e->getTraceAsString());
+        return 1;
     } finally {
-        // Restore original error handler
         restore_error_handler();
     }
 }
 
-// Run the demo
 if (PHP_SAPI === 'cli') {
-    main();
+    exit(main());
 } else {
     echo "This script must be run from the command line.\n";
     exit(1);
